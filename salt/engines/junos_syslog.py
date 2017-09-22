@@ -3,41 +3,61 @@
 Junos Syslog Engine
 ==========================
 
-An engine that listen to syslog message from Junos devices,
+.. versionadded:: 2017.7.0
+
+
+:depends: pyparsing, twisted
+
+
+An engine that listens to syslog message from Junos devices,
 extract event information and generate message on SaltStack bus.
 
-One can customize the name of the topic.
-The event data consists of the following fields:
-    a.  hostname
-    b.  hostip
-    c.  daemon
-    d.  event
-    e.  severity
-    f.  priority
-    g.  timestamp
-    h.  message
-    i.  pid
-    j.  raw (the raw event data forwarded from the device)
-The topic can consist of any of the combination of above fields,
-but the topic has to start with ‘jnpr/syslog’.
-So, we can have different combinations like:
-•   jnpr/syslog/hostip/daemon/event
-•   jnpr/syslog/daemon/severity
-The default topic is ‘jnpr/syslog/hostname/event’.
-The topic is to be specified in the configuration file.
+The event topic sent to salt is dynamically generated according to the topic title
+specified by the user. The incoming event data (from the junos device) consists
+of the following fields:
+
+1.   hostname
+2.   hostip
+3.   daemon
+4.   event
+5.   severity
+6.   priority
+7.   timestamp
+8.   message
+9.   pid
+10.   raw (the raw event data forwarded from the device)
+
+The topic title can consist of any of the combination of above fields,
+but the topic has to start with 'jnpr/syslog'.
+So, we can have different combinations:
+ - jnpr/syslog/hostip/daemon/event
+ - jnpr/syslog/daemon/severity
+
+The corresponding dynamic topic sent on salt event bus would look something like:
+
+ - jnpr/syslog/1.1.1.1/mgd/UI_COMMIT_COMPLETED
+ - jnpr/syslog/sshd/7
+The default topic title is 'jnpr/syslog/hostname/event'.
 
 The user can choose the type of data he/she wants of the event bus.
-Like, if one wants events pertaining to a particular daemon, he/she can
+Like, if one wants only events pertaining to a particular daemon, he/she can
 specify that in the configuration file:
+
+.. code-block:: yaml
+
     daemon: mgd
 
 One can even have a list of daemons like:
+
+.. code-block:: yaml
+
     daemon:
       - mgd
       - sshd
 
-:configuration:
-  Example configuration
+Example configuration (to be written in master config file)
+
+.. code-block:: yaml
 
     engines:
       - junos_syslog:
@@ -47,32 +67,46 @@ One can even have a list of daemons like:
             - mgd
             - sshd
 
-For junos_syslog engine to receive events syslog must be set on junos device.
+For junos_syslog engine to receive events, syslog must be set on the junos device.
 This can be done via following configuration:
+
+.. code-block:: shell
+
     set system syslog host <ip-of-the-salt-device> port 516 any any
 
-Here is a sample syslog event which is received from the junos device:
-  '<30>May 29 05:18:12 bng-ui-vm-9 mspd[1492]: No chassis configuration found'
+Below is a sample syslog event which is received from the junos device:
+
+.. code-block:: shell
+
+    '<30>May 29 05:18:12 bng-ui-vm-9 mspd[1492]: No chassis configuration found'
 
 The source for parsing the syslog messages is taken from:
-    https://gist.github.com/leandrosilva/3651640#file-xlog-py
+https://gist.github.com/leandrosilva/3651640#file-xlog-py
 '''
+from __future__ import absolute_import
 
 import re
 from time import strftime
 import logging
 
-import salt
-
 try:
     from twisted.internet.protocol import DatagramProtocol
     from twisted.internet import reactor, threads
     from pyparsing import Word, alphas, Suppress, Combine, nums, string, \
-        Optional, Regex, Literal, OneOrMore, LineEnd, LineStart, StringEnd, \
-        delimitedList
+        Optional, Regex, LineEnd, StringEnd, delimitedList
     HAS_TWISTED_AND_PYPARSING = True
 except ImportError:
     HAS_TWISTED_AND_PYPARSING = False
+
+    # Fallback class
+    class DatagramProtocol(object):
+        pass
+
+import salt.utils.event as event
+
+# Import 3rd-party libs
+from salt.ext import six
+from salt.ext.six.moves import range  # pylint: disable=redefined-builtin
 
 # logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
@@ -85,19 +119,16 @@ def __virtual__():
     Load only if twisted and pyparsing libs are present.
     '''
     if not HAS_TWISTED_AND_PYPARSING:
-        return (False, 'junos_syslog could not be loaded. \
-            Make sure you have twisted and pyparsing python libraries.')
+        return (False, 'junos_syslog could not be loaded.'
+                       ' Make sure you have twisted and pyparsing python libraries.')
     return True
 
 
-class Parser(object):
+class _Parser(object):
 
     def __init__(self):
         ints = Word(nums)
-        word = Word(alphas)
         EOL = LineEnd().suppress()
-        SOL = LineStart().leaveWhitespace()
-        blankline = SOL + LineEnd()
 
         # ip address of device
         ipAddress = Optional(
@@ -106,9 +137,6 @@ class Parser(object):
                 ".",
                 combine=True) + Suppress(
                     ":"))
-
-        # Received message
-        rec_msg = Suppress(OneOrMore(word)) + Suppress(Literal("'"))
 
         # priority
         priority = Suppress("<") + ints + Suppress(">")
@@ -124,7 +152,7 @@ class Parser(object):
         hostname = Word(alphas + nums + "_" + "-" + ".")
 
         # daemon
-        daemon = Word(alphas + "/" + "-" + "_" + ".") + Optional(
+        daemon = Word(alphas + nums + "/" + "-" + "_" + ".") + Optional(
             Suppress("[") + ints + Suppress("]")) + Suppress(":")
 
         # message
@@ -209,11 +237,11 @@ class Parser(object):
             return payload
 
 
-class SyslogServerFactory(DatagramProtocol):
+class _SyslogServerFactory(DatagramProtocol):
 
     def __init__(self, options):
         self.options = options
-        self.obj = Parser()
+        self.obj = _Parser()
         data = [
             "hostip",
             "priority",
@@ -252,7 +280,7 @@ class SyslogServerFactory(DatagramProtocol):
             # We are done processing the topic. All other arguments are the
             # filters given by the user. While processing the filters we don't
             # explicitly ignore the 'topic', but delete it here itself.
-            del(self.options['topic'])
+            del self.options['topic']
         else:
             self.title = ['jnpr', 'syslog', 'hostname', 'event']
 
@@ -280,7 +308,7 @@ class SyslogServerFactory(DatagramProtocol):
         send_this_event = True
         for key in options:
             if key in data:
-                if isinstance(options[key], (str, int)):
+                if isinstance(options[key], (six.string_types, int)):
                     if str(options[key]) != str(data[key]):
                         send_this_event = False
                         break
@@ -303,11 +331,11 @@ class SyslogServerFactory(DatagramProtocol):
             if 'event' in data:
                 topic = 'jnpr/syslog'
 
-            for i in range(2, len(self.title)):
-                topic += '/' + str(data[self.title[i]])
-                log.debug(
-                    'Junos Syslog - sending this event on the bus: \
-                    {0} from {1}'.format(data, host))
+                for i in range(2, len(self.title)):
+                    topic += '/' + str(data[self.title[i]])
+                    log.debug(
+                        'Junos Syslog - sending this event on the bus: \
+                        {0} from {1}'.format(data, host))
                 result = {'send': True, 'data': data, 'topic': topic}
                 return result
             else:
@@ -331,9 +359,9 @@ class SyslogServerFactory(DatagramProtocol):
             # If the engine is run on master, get the event bus and send the
             # parsed event.
             if __opts__['__role'] == 'master':
-                salt.utils.event.get_master_event(__opts__,
-                                                  __opts__['sock_dir']
-                                                  ).fire_event(data, topic)
+                event.get_master_event(__opts__,
+                                       __opts__['sock_dir']
+                                       ).fire_event(data, topic)
             # If the engine is run on minion, use the fire_master execution
             # module to send event on the master bus.
             else:
@@ -343,7 +371,6 @@ class SyslogServerFactory(DatagramProtocol):
         '''
         Log the error messages.
         '''
-        
         log.error(err_msg.getErrorMessage)
 
     def datagramReceived(self, data, connection_details):
@@ -356,8 +383,9 @@ class SyslogServerFactory(DatagramProtocol):
             self.options)
         d.addCallbacks(self.send_event_to_salt, self.handle_error)
 
+
 def start(port=516, **kwargs):
 
     log.info('Starting junos syslog engine (port {0})'.format(port))
-    reactor.listenUDP(port, SyslogServerFactory(kwargs))
+    reactor.listenUDP(port, _SyslogServerFactory(kwargs))
     reactor.run()
